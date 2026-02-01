@@ -8,7 +8,8 @@ const createEvent = async (req, res) => {
     console.log("Request body: ", req.body);
 
     // Input validation
-    const { bookingId, eventId, userId, seats } = req.body;
+    const { bookingId, eventId, userId, seats, forcedFail } = req.body;
+    //forcedFail is for testing purposes. If true, means consumer will fail to process the event.
 
     if (!bookingId || !eventId || !userId) {
       return res.status(400).json({
@@ -40,6 +41,7 @@ const createEvent = async (req, res) => {
         eventId,
         userId,
         seats,
+        forcedFail: forcedFail || false,
       },
     });
 

@@ -73,6 +73,7 @@ async function startConsumer(redis, shutdownState = { requested: false }) {
                 }
 
                 const parsedPayload = JSON.parse(payload);
+                const { forcedFail } = parsedPayload;
 
                 try {
                     // 3 Idempotency check
@@ -83,6 +84,11 @@ async function startConsumer(redis, shutdownState = { requested: false }) {
                         await RetryEvent.deleteOne({ streamMessageId: id });
                         continue;
                     }
+
+                    if (forcedFail === true) {
+                        throw new Error("Forced failure for retry testing");
+                    }
+                    //Only for testing purposes.
 
                     // 4 Perform side effect (projection)
                     await EventProjection.create({
