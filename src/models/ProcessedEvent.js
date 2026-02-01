@@ -29,9 +29,8 @@ const processedEventSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Ensure unique indexes
-processedEventSchema.index({ eventId: 1 }, { unique: true });
-processedEventSchema.index({ idempotencyKey: 1 }, { unique: true });
+// Unique indexes are automatically created by the unique: true in schema fields above
+// No need to explicitly create them again
 
 const ProcessedEvent = mongoose.model("ProcessedEvent", processedEventSchema);
 
