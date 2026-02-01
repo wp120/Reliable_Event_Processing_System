@@ -27,14 +27,15 @@ async function createGroupIfNotExists(redis) {
 /**
  * Starts the Redis stream consumer.
  * @param {RedisClientType} redis - connected Redis client
+ * @param {{ requested: boolean }} shutdownState - shared flag; when .requested is true, consumer exits after current message
  */
-async function startConsumer(redis) {
+async function startConsumer(redis, shutdownState = { requested: false }) {
     // 1 Create group
     await createGroupIfNotExists(redis);
 
     console.log("Consumer started, waiting for messages...");
 
-    while (true) {
+    while (!shutdownState.requested) {
         try {
             const response = await redis.xReadGroup(
                 GROUP,
@@ -72,7 +73,7 @@ async function startConsumer(redis) {
 
                     // 4 Mark processed
                     await ProcessedEvent.create({
-                        eventId: id,
+                        streamMessageId: id,
                         idempotencyKey,
                         eventType,
                         status: "PROCESSED",
@@ -87,13 +88,16 @@ async function startConsumer(redis) {
                     console.error("Error processing message:", err);
                     // No ACK → Redis will retry
                 }
+                if (shutdownState.requested) break;
             }
         } catch (err) {
             console.error("Consumer read error:", err);
+            if (shutdownState.requested) break;
             // wait before retrying to avoid tight loop on Redis errors
             await new Promise((res) => setTimeout(res, 1000));
         }
     }
+    console.log("Consumer stopped");
 }
 
 module.exports = { startConsumer };

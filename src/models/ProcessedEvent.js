@@ -1,7 +1,7 @@
 const mongoose = require("mongoose");
 
 const processedEventSchema = new mongoose.Schema({
-  eventId: {
+  streamMessageId: {
     type: String,
     required: true,
     unique: true
@@ -29,8 +29,7 @@ const processedEventSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Unique indexes are automatically created by the unique: true in schema fields above
-// No need to explicitly create them again
+// streamMessageId = Redis stream message ID (e.g. "1234-0"); distinct from payload eventId
 
 const ProcessedEvent = mongoose.model("ProcessedEvent", processedEventSchema);
 

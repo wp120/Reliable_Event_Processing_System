@@ -1,8 +1,5 @@
 const mongoose = require("mongoose");
 
-// Handle graceful shutdown (register once, outside the function)
-let isShutdownHandlerRegistered = false;
-
 const connectDB = async () => {
   try {
     const mongoURI = process.env.MONGODB_URI;
@@ -25,16 +22,6 @@ const connectDB = async () => {
     mongoose.connection.on("disconnected", () => {
       console.log("MongoDB disconnected");
     });
-
-    // Handle graceful shutdown (only register once)
-    if (!isShutdownHandlerRegistered) {
-      process.on("SIGINT", async () => {
-        await mongoose.connection.close();
-        console.log("MongoDB connection closed due to app termination");
-        process.exit(0);
-      });
-      isShutdownHandlerRegistered = true;
-    }
 
     return conn;
   } catch (error) {
