@@ -2,10 +2,13 @@ const {
     STREAM,
     GROUP,
     CONSUMER,
+    MAX_RETRIES,
 } = require("./constants");
 
 const ProcessedEvent = require("../models/ProcessedEvent");
 const EventProjection = require("../models/EventProjection");
+const RetryEvent = require("../models/RetryEvent");
+const DeadLetterEvent = require("../models/DeadLetterEvent");
 
 /**
  * Creates the consumer group if it doesn't exist.
@@ -25,45 +28,63 @@ async function createGroupIfNotExists(redis) {
 }
 
 /**
+ * Exponential backoff delay in ms. Cap at 30s.
+ */
+function getBackoffMs(retryCount) {
+    return Math.min(2 ** retryCount * 1000, 30_000);
+}
+
+/**
  * Starts the Redis stream consumer.
  * @param {RedisClientType} redis - connected Redis client
  * @param {{ requested: boolean }} shutdownState - shared flag; when .requested is true, consumer exits after current message
  */
 async function startConsumer(redis, shutdownState = { requested: false }) {
-    // 1 Create group
     await createGroupIfNotExists(redis);
 
     console.log("Consumer started, waiting for messages...");
 
     while (!shutdownState.requested) {
         try {
-            const response = await redis.xReadGroup(
-                GROUP,
-                CONSUMER,
-                [{ key: STREAM, id: ">" }],
-                { COUNT: 1, BLOCK: 5000 }
-            );
+            // 1 Read new messages (blocking) and pending messages (non-blocking)
+            const [newResponse, pendingResponse] = await Promise.all([
+                redis.xReadGroup(GROUP, CONSUMER, [{ key: STREAM, id: ">" }], { COUNT: 10, BLOCK: 5000 }),
+                redis.xReadGroup(GROUP, CONSUMER, [{ key: STREAM, id: "0" }], { COUNT: 10 }),
+            ]);
 
-            if (!response) continue; // no new messages, loop again
+            const allMessages = [];
+            if (newResponse && newResponse[0]) allMessages.push(...newResponse[0].messages);
+            if (pendingResponse && pendingResponse[0]) allMessages.push(...pendingResponse[0].messages);
 
-            const messages = response[0].messages;
+            if (allMessages.length === 0) continue;
 
-            for (const msg of messages) {
+            const now = new Date();
+
+            for (const msg of allMessages) {
+                if (shutdownState.requested) break;
+
                 const { id, message } = msg;
                 const { eventType, idempotencyKey, payload } = message;
+
+                // 2 Respect nextRetryAt - skip if not ready to retry
+                const retryDoc = await RetryEvent.findOne({ streamMessageId: id });
+                if (retryDoc && retryDoc.nextRetryAt > now) {
+                    continue; // don't process yet, don't ACK
+                }
 
                 const parsedPayload = JSON.parse(payload);
 
                 try {
-                    // 2 Idempotency check
+                    // 3 Idempotency check
                     const alreadyProcessed = await ProcessedEvent.findOne({ idempotencyKey });
                     if (alreadyProcessed) {
                         console.log(`Skipping already processed event: ${idempotencyKey}`);
                         await redis.xAck(STREAM, GROUP, id);
+                        await RetryEvent.deleteOne({ streamMessageId: id });
                         continue;
                     }
 
-                    // 3 Perform side effect (projection)
+                    // 4 Perform side effect (projection)
                     await EventProjection.create({
                         eventType,
                         sourceEventId: id,
@@ -71,7 +92,7 @@ async function startConsumer(redis, shutdownState = { requested: false }) {
                         createdAt: new Date(),
                     });
 
-                    // 4 Mark processed
+                    // 5 Mark processed
                     await ProcessedEvent.create({
                         streamMessageId: id,
                         idempotencyKey,
@@ -80,20 +101,63 @@ async function startConsumer(redis, shutdownState = { requested: false }) {
                         processedAt: new Date(),
                     });
 
-                    // 5 ACK only after success
                     await redis.xAck(STREAM, GROUP, id);
+                    await RetryEvent.deleteOne({ streamMessageId: id });
                     console.log(`Processed and ACKed event: ${idempotencyKey}`);
 
                 } catch (err) {
                     console.error("Error processing message:", err);
-                    // No ACK → Redis will retry
+
+                    const existingRetry = await RetryEvent.findOne({ streamMessageId: id });
+                    const retryCount = existingRetry ? existingRetry.retryCount + 1 : 1;
+
+                    if (retryCount >= MAX_RETRIES) {
+                        // Move to DLQ and ACK (stop retrying)
+                        await DeadLetterEvent.create({
+                            eventType,
+                            sourceEventId: id,
+                            payload: parsedPayload,
+                            createdAt: now,
+                        });
+                        await RetryEvent.findOneAndUpdate(
+                            { streamMessageId: id },
+                            {
+                                streamMessageId: id,
+                                idempotencyKey,
+                                retryCount,
+                                lastError: err.message,
+                                nextRetryAt: now,
+                                status: "DEAD",
+                            },
+                            { upsert: true }
+                        );
+                        await redis.xAck(STREAM, GROUP, id);
+                        console.log(`Moved to DLQ after ${retryCount} failures: ${idempotencyKey}`);
+                    } else {
+                        // Schedule retry with exponential backoff
+                        const delayMs = getBackoffMs(retryCount);
+                        const nextRetryAt = new Date(now.getTime() + delayMs);
+
+                        await RetryEvent.findOneAndUpdate(
+                            { streamMessageId: id },
+                            {
+                                streamMessageId: id,
+                                idempotencyKey,
+                                retryCount,
+                                lastError: err.message,
+                                nextRetryAt,
+                                status: "RETRYING",
+                            },
+                            { upsert: true }
+                        );
+                        // No ACK → message stays pending for retry
+                        console.log(`Retry ${retryCount}/${MAX_RETRIES} scheduled for ${nextRetryAt.toISOString}: ${idempotencyKey}`);
+                    }
                 }
-                if (shutdownState.requested) break;
             }
         } catch (err) {
             console.error("Consumer read error:", err);
             if (shutdownState.requested) break;
-            // wait before retrying to avoid tight loop on Redis errors
             await new Promise((res) => setTimeout(res, 1000));
         }
     }
